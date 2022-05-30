@@ -1,16 +1,22 @@
 #!/usr/bin/env python
 # coding: utf-8
 
-# # Subset ERA5 from Global grid to NWA25 domain and calculate Specific Huimdity & Total Rain Rate
+# Subset ERA5 from Global grid to NWA25 domain and calculate Specific Huimdity & Total Rain Rate
 
+# Tasks
+#  1. Subset first
+#  2. Make periodic
+#  4. Flooding
+#  3. Padding (not the first record)
 
-# slice down the data
-import xarray as xr
-import os
-import cftime
 import numpy as np
+import xarray as xr
+import sys, os, cftime
 from glob import glob
-import os
+from HCtFlood import kara as flood
+import xesmf
+
+# Subsetting functions
 
 # Functions for humidity borrowed and adapted from MetPy.calc: https://unidata.github.io/MetPy/latest/api/generated/metpy.calc.html
 def mixing_ratio(partial_press, total_press, molecular_weight_ratio=0.622):
@@ -29,6 +35,7 @@ def saturation_vapor_pressure(temperature):
 
 def saturation_mixing_ratio(total_press, temperature):
     return mixing_ratio(saturation_vapor_pressure(temperature), total_press)
+
 
 def make_periodic_append_longitude(ds, dvar, delta_long):
     # This appends a longitude point for the given variable
@@ -69,9 +76,10 @@ def save_attrs(ds):
     return attr_array
 
 def fix_encoding_attrs(ds, oldattrs):
+    global datatype
 
     for dvar in list(ds.variables):
-        ds[dvar].encoding.update({'dtype':'float64', '_FillValue': None})
+        ds[dvar].encoding.update({'dtype': datatype, '_FillValue': None})
         if 'missing_value' in ds[dvar].encoding: ds[dvar].encoding.pop('missing_value')
         if 'scale_factor' in ds[dvar].encoding: ds[dvar].encoding.pop('scale_factor')
         if 'add_offset' in ds[dvar].encoding: ds[dvar].encoding.pop('add_offset')
@@ -79,48 +87,233 @@ def fix_encoding_attrs(ds, oldattrs):
 
     return ds
 
+# Flooding functions
 
-era5_dict = {'ERA5_sea_ice_cover':'siconc',
-            'ERA5_10m_u_component_of_wind':'u10',
-            'ERA5_sea_surface_temperature':'sst',
-            'ERA5_10m_v_component_of_wind':'v10',
-            'ERA5_2m_temperature':'t2m',
-            'ERA5_surface_solar_radiation_downwards':'ssrd',
-            'ERA5_surface_thermal_radiation_downwards':'strd',
-            'ERA5_total_rain_rate':'trr',
-            'ERA5_mean_sea_level_pressure':'msl',
-            'ERA5_2m_specific_humidity':'huss'}
+def interp_landmask(landmask_file):
+    landmask = xr.open_dataset(landmask_file).rename({'x': 'lon', 'y': 'lat'})
+    lon_centers = landmask['lon'].values
+    lat_centers = landmask['lat'].values
+    lon_corners = 0.25 * (
+        lon_centers[:-1, :-1]
+        + lon_centers[1:, :-1]
+        + lon_centers[:-1, 1:]
+        + lon_centers[1:, 1:]
+    )
+    # have to add 2 extra rows/columns to the array becuase we remove 1 when we calculate the corners from the center values
+    lon_corners_exp = np.full((lon_corners.shape[0]+2,lon_corners.shape[1]+2),np.nan)
+    lon_corners_exp[:-2,:-2] = lon_corners
+    landmask['lon_b'] = xr.DataArray(data=lon_corners_exp, dims=("nyp", "nxp"))
+    lon_b = landmask['lon_b']
+    filled = lon_b.interpolate_na(dim='nyp',method='linear',fill_value="extrapolate")
+    filled_lon = filled.interpolate_na(dim='nxp',method='linear',fill_value="extrapolate")
+    
+    # interpolate latitidue corners from latitude cell centers
+    lat_corners = 0.25 * (
+        lat_centers[:-1, :-1]
+        + lat_centers[1:, :-1]
+        + lat_centers[:-1, 1:]
+        + lat_centers[1:, 1:]
+    )
+
+    # create expanded latitude corners array and then interpolate the values so our nxp, nyp = nx+1, ny+1
+    lat_corners_exp = np.full((lat_corners.shape[0]+2,lat_corners.shape[1]+2),np.nan)
+    lat_corners_exp[:-2,:-2] = lat_corners
+    landmask['lat_b'] = xr.DataArray(data=lat_corners_exp, dims=("nyp", "nxp"))
+    lat_b = landmask['lat_b']
+    filled= lat_b.interpolate_na(dim='nyp',method='linear',fill_value="extrapolate")
+    filled_lat = filled.interpolate_na(dim='nxp',method='linear',fill_value="extrapolate")
+    landmask['lon_b'] = filled_lon
+    landmask['lat_b'] = filled_lat
+    landmask['mask'] = landmask['mask'].where(landmask['mask'] != 1)
+    
+    return landmask
+
+def interp_era5(era5_ds, era5_var):
+    #era = xr.open_dataset(era5_file)
+    era = era5_ds.copy()
+    era = era.rename({'longitude': 'lon', 'latitude': 'lat'})
+    if "lon" in era.coords:
+        era = era.assign_coords(lon=(np.where(era['lon'].values > 180., era['lon'].values - 360, era['lon'].values)))
+        era = era.swap_dims({'lon' : 'nx'})    
+        era = era.swap_dims({'lat' : 'ny'}) 
+    if "lon" in era.data_vars:
+        era['lon'].values =  np.where(era['lon'].values > 180., era['lon'].values - 360, era['lon'].values)
+
+    lon_centers = era['lon'].values
+    lat_centers = era['lat'].values
+    # To use conservative regidding, we need the cells corners. 
+    # Since they are not provided, we are creating some using a crude approximation. 
+    lon_corners = 0.25 * (
+        lon_centers[:-1]
+        + lon_centers[1:]
+        + lon_centers[:-1]
+        + lon_centers[1:]
+    )
+
+    lat_corners = 0.25 * (
+        lat_centers[:-1]
+        + lat_centers[1:]
+        + lat_centers[:-1]
+        + lat_centers[1:]
+    )
+
+    # trim down era by 1 cell
+    era = era.isel(nx=slice(1,-1), ny=slice(1,-1))
+    da_era_var=era[era5_var].values
+    
+    # add nxp and nyp dimensions for the lat/lon corners to latch onto
+    era = era.expand_dims({'nyp':(len(era.lat) + 1)})
+    era = era.expand_dims({'nxp':(len(era.lon) + 1)})
+
+    # add the lat/lon corners as data variables,
+    era['lat_corners'] = xr.DataArray(data=lat_corners, dims=("nyp"))
+    era['lon_corners'] = xr.DataArray(data=lon_corners, dims=("nxp"))
+    # drop the variable
+    era = era.drop_vars(era5_var)
+    era[era5_var] = xr.DataArray(data=da_era_var, dims=("time" ,"lat", "lon"))
+    
+    # create meshgrids for center and corner points so we can co-locate with landmask meshgrids.
+    lon2d, lat2d = np.meshgrid(era.lon.values, era.lat.values)
+    lon2d_b, lat2d_b = np.meshgrid(era.lon_corners.values, era.lat_corners.values)
+    
+    # assign coordinates now that we have our corner points
+    era = era.assign_coords({"lon" : (("ny", "nx"), lon2d)})
+    era = era.assign_coords({"lat" : (("ny", "nx"), lat2d)})
+    era = era.assign_coords({"lon_b" : (("nyp", "nxp"), lon2d_b)})
+    era = era.assign_coords({"lat_b" : (("nyp", "nxp"), lat2d_b)})
+    
+    return era
+
+#def flood_era5_data(era5_file,era5_var,landmask_file, outfile, reuse_weights=False):
+def flood_era5_data(era5_ds, era5_var, landmask_file, reuse_weights=False):
+    global datatype
+
+    # interp landmask
+    landmask = interp_landmask(landmask_file)
+
+    #interp era
+    era = interp_era5(era5_ds, era5_var)
+    
+    # regrid conservatively: conservative does the best, especially along fine points
+    regrid_domain = xesmf.Regridder(landmask, era, 'conservative', 
+                                    periodic=False, reuse_weights=reuse_weights, filename='regrid_domain.nc')
+    land_regrid = regrid_domain(landmask.mask)
+    land_regrid = land_regrid.expand_dims(time=era['time'])
+    land_regrid = land_regrid.transpose("time", "ny", "nx")
+    #print(land_regrid)
+    era = era.transpose("time", "lat", "lon", "ny", "nx", "nyp", "nxp")
+    # cut era based on regridded landmask
+    era_cut = era[era5_var].where(land_regrid.values == 0)
+
+    # flood our cut out points
+    flooded = flood.flood_kara(era_cut)
+    flooded = flooded.isel(z=0).drop('z')
+    #print(flooded)
+    # note that this current version of this code will cut down your era5 domain by 2 rows/colse)
+    #era = xr.open_dataset(era5_file)
+    era = era5_ds.copy()
+    era = era.isel(longitude=slice(1,len(era.longitude)-1), latitude=slice(1,len(era.latitude)-1))
+    era = era.transpose("time", "latitude", "longitude")
+    
+    era[era5_var].values = flooded.values    
+    
+    if era5_var=='ssrd' or era5_var=='strd':
+        # convert radiation from J/m2 to W/m2: https://confluence.ecmwf.int/pages/viewpage.action?pageId=155337784
+        era[era5_var].values = era[era5_var].values/3600
+        era[era5_var].attrs['units'] = 'W m-2'
+    if era5_var=='huss':
+        era[era5_var].attrs['dtype'] = datatype
+        era[era5_var].attrs['standard_name'] = 'specific_humidity'
+        #era[era5_var].attrs['long_name'] = 'Near-Surface Specific Humidity'
+        era[era5_var].attrs['long_name'] = '2 meter near-surface specific humidity'
+        era[era5_var].attrs['coordinates'] = 'height'
+        era[era5_var].attrs['units'] = 'kg kg-1'
+        era['height'] = 2.0
+        era['height'].attrs['units'] = "m"
+        era['height'].attrs['axis'] = "Z"
+        era['height'].attrs['positive'] = "up"
+        era['height'].attrs['long_name'] = "height"
+        era['height'].attrs['standard_name'] = "height"
+
+    #era.to_netcdf(outfile,format='NETCDF4_CLASSIC')
+    #era.close()
+
+    return era
+
+# Padding functions
+
+
+
+# The processing order is set by this dictionary
+era5_dict = {
+    'ERA5_total_rain_rate':                     'trr',
+    'ERA5_sea_ice_cover':                       'siconc',
+    'ERA5_10m_u_component_of_wind':             'u10',
+    'ERA5_10m_v_component_of_wind':             'v10',
+    'ERA5_2m_temperature':                      't2m',
+    'ERA5_2m_specific_humidity':                'huss',
+    'ERA5_sea_surface_temperature':             'sst',
+    'ERA5_surface_solar_radiation_downwards':   'ssrd',
+    'ERA5_surface_thermal_radiation_downwards': 'strd',
+    'ERA5_mean_sea_level_pressure':             'msl'
+}
+
+# For testing, only process one field
+era5_dict = {
+    'ERA5_total_rain_rate':                     'trr'
+}
 
 # subset
-years = range(1996,1998)
+years = range(1993,1995)
 latsub = slice(90,39)
 lonsub = slice(0,360)
 
 # storage
 # NOT USED
-#subdir2 = "/Volumes/P8/workdir/james/ERA5/nwa25/subset/"
 era5dir = "/import/AKWATERS/kshedstrom/ERA5/"
 subdir = "/import/AKWATERS/jrcermakiii/data/ERA5_periodic_subset/"
+landmask_file = "/import/AKWATERS/jrcermakiii/configs/Arctic12/INPUT2/land_mask.nc"
+datatype = 'float32'
+usePadding = False
+useFlooding = True
 
-# Tasks
-#  1. Subset first
-#  2. Make periodic
+# Padding is required for MOM6 to provide continuity between restarts of
+# runs between blocks of time (in this case by year).
+firstYear=1993
 
+# Main program
 for f in era5_dict.keys():
     print(f)
     for y in years:
         print("-> %d" % (y))
 
+        # These two fields require special processing
         if f == 'ERA5_total_rain_rate':
             crr = xr.open_dataset(str(era5dir + 'ERA5_convective_rain_rate_' + str(y) + '.nc'))
-            breakpoint()
             crr = xr.open_dataset(str(era5dir + 'ERA5_convective_rain_rate_' + str(y) + '.nc')).sel(latitude=latsub, longitude=lonsub)
             lsrr = xr.open_dataset(str(era5dir + 'ERA5_large_scale_rain_rate_' + str(y) + '.nc')).sel(latitude=latsub, longitude=lonsub)
-            trr = crr.drop('crr')
+            #trr = crr.drop('crr')
+            trr = xr.Dataset()
             trr['trr'] = crr['crr'] + lsrr['lsrr']
-            trr['trr'].attrs = {'units': 'kg m-2 s-1','long_name': 'Total Rainfall Rate'}
-            trr['trr'].encoding = {k: v for k, v in crr.crr.encoding.items() if k in {'_FillValue', 'missing_value', 'dtype'}}
-            trr.to_netcdf(str(subdir + f + '_' + str(y) + ".nc"), mode='w', format='NETCDF4_CLASSIC')
+            trr['trr'].attrs = {'units': 'kg m-2 s-1', 'long_name': 'Total rain rate (convective and large scale)'}
+
+            # Remove all _FillValue
+            all_vars = list(trr.data_vars.keys()) + list(trr.coords.keys())
+            encodings = {v: {'_FillValue': None, 'dtype': datatype} for v in all_vars}
+
+            # Also fix the time encoding
+            encodings['time'].update({'dtype': datatype, 'calendar': 'gregorian', 'units': 'hours since 1900-01-01 00:00:00'})
+
+            # Flood
+            if useFlooding:
+                print("  -> flood")
+                trr = flood_era5_data(era5_ds=trr, era5_var='trr', reuse_weights=False, landmask_file=landmask_file)
+
+            # Pad
+            if usePadding and y > firstYear:
+                print("  -> pad")
+
+            trr.to_netcdf(str(subdir + f + '_' + str(y) + ".nc"), mode='w', format='NETCDF4_CLASSIC', encoding=encodings)
             crr.close()
             lsrr.close()
             trr.close()
@@ -134,30 +327,42 @@ for f in era5_dict.keys():
 
             sphum.name = 'huss'
             sphum = sphum.to_dataset()
+            sphum['huss'].attrs['units'] = 'kg kg-1'
+            sphum['huss'].attrs['long_name'] = '2 meter specific humidity'
+            sphum = make_periodic_append_longitude(sphum, era5_dict[f], 0.25)
 
             # Remove all _FillValue
             all_vars = list(sphum.data_vars.keys()) + list(sphum.coords.keys())
             encodings = {v: {'_FillValue': None} for v in all_vars}
 
             # Also fix the time encoding
-            encodings['time'].update({'dtype':'float64', 'calendar': 'gregorian', 'units': 'hours since 1900-01-01 00:00:00'})
+            encodings['time'].update({'dtype': datatype, 'calendar': 'gregorian', 'units': 'hours since 1900-01-01 00:00:00'})
             
             fout=str(subdir + f + '_' + str(y) + ".nc")
             sphum.to_netcdf(
                 fout,
                 format='NETCDF4_CLASSIC',
                 engine='netcdf4',
-                encoding=encodings,
-                unlimited_dims=['time']
+                encoding=encodings
             )
             sphum.close()
             
+        # All other fields conform to a single processing method
         if 'total_rain_rate' not in f and 'specific_humidity' not in f:
+            #DONE
+            target = str(subdir + f + '_' + str(y) + ".nc")
+            # Skip files that exist
+            if os.path.isfile(target):
+                continue
             ds = xr.open_dataset(str(era5dir + f + '_' + str(y) + ".nc")).sel(latitude=latsub, longitude=lonsub)
             ds_attrs = save_attrs(ds)
             ds = make_periodic_append_longitude(ds, era5_dict[f], 0.25)
             ds = fix_encoding_attrs(ds, ds_attrs)
-            ds.to_netcdf(str(subdir + f + '_' + str(y) + ".nc"),format="NETCDF4_CLASSIC")
+
+            # Flood
+            # Pad
+
+            ds.to_netcdf(target, format="NETCDF4_CLASSIC")
             ds.close()
-            breakpoint()
+            #breakpoint()
 
