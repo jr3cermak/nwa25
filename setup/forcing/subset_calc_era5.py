@@ -1,6 +1,9 @@
 #!/usr/bin/env python
 # coding: utf-8
 
+# TODO:
+# - this leaks memory!
+
 # Subset ERA5 from Global grid to NWA25 domain and calculate Specific Huimdity & Total Rain Rate
 
 # Tasks
@@ -133,7 +136,7 @@ def interp_landmask(landmask_file):
 
 def interp_era5(era5_ds, era5_var):
     #era = xr.open_dataset(era5_file)
-    era = era5_ds.copy()
+    era = era5_ds
     era = era.rename({'longitude': 'lon', 'latitude': 'lat'})
     if "lon" in era.coords:
         era = era.assign_coords(lon=(np.where(era['lon'].values > 180., era['lon'].values - 360, era['lon'].values)))
@@ -212,9 +215,9 @@ def flood_era5_data(era5_ds, era5_var, landmask_file, reuse_weights=False):
     flooded = flood.flood_kara(era_cut)
     flooded = flooded.isel(z=0).drop('z')
     #print(flooded)
-    # note that this current version of this code will cut down your era5 domain by 2 rows/colse)
+    # note that this current version of this code will cut down your era5 domain by 2 rows/cols)
     #era = xr.open_dataset(era5_file)
-    era = era5_ds.copy()
+    era = era5_ds
     era = era.isel(longitude=slice(1,len(era.longitude)-1), latitude=slice(1,len(era.latitude)-1))
     era = era.transpose("time", "latitude", "longitude")
     
@@ -396,7 +399,7 @@ for f in era5_dict.keys():
                 # Flood
                 if useFlooding:
                     print("  -> flood")
-                    sphum = flood_era5_data(era5_ds=sphum, era5_var='sphum', reuse_weights=False, landmask_file=landmask_file)
+                    sphum = flood_era5_data(era5_ds=sphum, era5_var='huss', reuse_weights=False, landmask_file=landmask_file)
 
                 sphum.to_netcdf(
                     thisYear,
