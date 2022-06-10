@@ -47,6 +47,7 @@ def fill_missing(arr, xdim='locations', zdim='z'):
     Returns:
         Filled DataArray or Dataset.
     """
+    # Possibly use bfill here? Based on Andrew Ross email correspondence
     filled = arr.ffill(dim=xdim, limit=None)
     if zdim is not None:
         filled = filled.ffill(dim=zdim, limit=None).fillna(0)
@@ -252,9 +253,9 @@ def z_to_dz(ds, max_depth=6500.):
     da_dz = xarray.DataArray(
         dz,
         coords=[
-            ('time', ds['time']),
-            ('z', ds['z']),
-            ('locations', ds.locations)]
+            ('time', ds['time'].data),
+            ('z', ds['z'].data),
+            ('locations', ds.locations.data)]
     )
     # attributes seem to not copy over when creating the new array
     for v in ['time', 'z', 'locations']:
@@ -444,7 +445,44 @@ class Segment():
             ds[f'lon_{self.segstr}'] = ((f'ny_{self.segstr}', ), self.coords['lon'])
             ds[f'lat_{self.segstr}'] = ((f'ny_{self.segstr}', ), self.coords['lat'])
         return ds
-    
+
+    def create_input_data_mask(self, ds):
+        """
+        Create a subset of the global grid for providing boundary conditions.
+        """
+
+        # Coordinate information is in ds.coords['lat','lon','angle']
+        minLat = -1
+        maxLat = -1
+        minLon = -1
+        maxLon = -1
+
+        # Find the nearest grid point and paint a 5x5 area around it
+        for pt in range(0,len(self.coords['lat'])):
+            lat = self.coords['lat'][pt].data
+            lat_idx = (np.abs(ds['lat'] - lat)).argmin()
+            lon = self.coords['lon'][pt].data
+            lon_idx = (np.abs(ds['lon'] - lon)).argmin()
+            #print(lat,lon,":",ds['lat'][lat_idx].values,ds['lon'][lon_idx].values)
+            if minLat == -1:
+                minLat = lat_idx
+                maxLat = lat_idx
+                minLon = lon_idx
+                maxLon = lon_idx
+            if lat_idx > maxLat:
+                maxLat = lat_idx
+            if lat_idx < minLat:
+                minLat = lat_idx
+            if lon_idx > maxLon:
+                maxLon = lon_idx
+            if lon_idx < minLon:
+                minLon = lon_idx
+
+        minLat = minLat.to_dict()['data']
+        maxLat = maxLat.to_dict()['data']
+        minLon = minLon.to_dict()['data']
+        maxLon = maxLon.to_dict()['data']
+   
     def regrid_velocity(
                 self, usource, vsource, 
                 method='nearest_s2d', periodic=False, write=True, 
@@ -464,6 +502,8 @@ class Segment():
 
         Returns:
             xarray.Dataset: Dataset of regridded boundary data.
+
+        NOTES: Maybe use bilinear instead? Based on Andrew Ross email correspondence
         """
         if flood:
             usource = flood_missing(usource, xdim=xdim, ydim=ydim, zdim=zdim)
@@ -521,21 +561,27 @@ class Segment():
 
         # Need to transpose so that time is first,
         # so that it can be the unlimited dimension
-        print("at transpose step")
+        #print("at transpose step")
         ds_uv = ds_uv.transpose('time', 'z', 'locations')
+        #print("past transpose step")
         
-        print("past transpose step")
         # Add thickness
+        #print("start z_to_dz()")
         dz = z_to_dz(ds_uv)
+        #print("done z_to_dz()")
         ds_uv[f'dz_u_{self.segstr}'] = dz
         ds_uv[f'dz_v_{self.segstr}'] = dz
 
+        #print("np.arange()")
         ds_uv['z'] = np.arange(len(ds_uv['z']))
 
+        #print("expand_dims()")
         ds_uv = self.expand_dims(ds_uv)
+        #print("rename_dims()")
         ds_uv = self.rename_dims(ds_uv)
 
         if write:
+            #print("to_netcdf()")
             self.to_netcdf(ds_uv, 'uv', **kwargs)
         
         return ds_uv
@@ -563,6 +609,8 @@ class Segment():
 
         Returns:
             xarray.Dataset: Dataset of regridded boundary data.
+
+        NOTES: Maybe use bilinear instead? Based on Andrew Ross email correspondence
         """
         if source_var is not None:
             name =  source_var
@@ -591,7 +639,7 @@ class Segment():
         elif self.border in ['west', 'east']:
             tdest=tdest.rename({'nyp': 'locations'})
         
-        print('at tsource coords')
+        #print('at tsource coords')
         if 'z' in tsource.coords:
             tdest = fill_missing(tdest)
             # Need to transpose so that time is first,
@@ -754,7 +802,7 @@ class Segment():
             reuse_weights=False
         )
         
-        print("done regridding")
+        #print("done regridding")
         # Interpolate each real and imaginary parts to segment.
         uredest = regrid_u(uresource)['uRe']
         uimdest = regrid_u(uimsource)['uIm']
