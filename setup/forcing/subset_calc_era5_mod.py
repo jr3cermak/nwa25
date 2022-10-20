@@ -17,7 +17,7 @@ import xarray as xr
 import sys, os, cftime, warnings
 from glob import glob
 from HCtFlood import kara as flood
-import xesmf as xe
+import xesmf
 
 # Turn off certain messages: FutureWarning(xesmf)
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -43,9 +43,10 @@ def saturation_mixing_ratio(total_press, temperature):
     return mixing_ratio(saturation_vapor_pressure(temperature), total_press)
 
 
-def make_periodic_append_longitude(ds, dvar, delta_long, has_time=True):
+def make_periodic_append_longitude(ds, dvar, delta_long):
     # This appends a longitude point for the given variable
 
+    times = ds['time']
     latitudes = ds['latitude']
     longitudes = ds['longitude']
 
@@ -56,37 +57,19 @@ def make_periodic_append_longitude(ds, dvar, delta_long, has_time=True):
     datasets.append(longitudes[-1] + delta_long)
     longitudes = xr.concat(datasets, dim='longitude')
 
-    if has_time:
-        times = ds['time']
-
-        # Form the new data structure with a periodic longitude
-        ds_ext = xr.Dataset({
-            dvar : xr.DataArray(
-                data   = np.zeros((len(range(0,ds.dims['time'])), len(range(0,ds.dims['latitude'])), len(range(0,ds.dims['longitude']+1)))),
-                dims   = ['time', 'latitude', 'longitude'],
-                coords = {'time': times, 'latitude' : latitudes, 'longitude' : longitudes},
-                attrs  = {
-                    'units'     : ds[dvar].attrs['units']
-                })
+    # Form the new data structure with a periodic longitude
+    ds_ext = xr.Dataset({
+        dvar : xr.DataArray(
+            data   = np.zeros((len(range(0,ds.dims['time'])), len(range(0,ds.dims['latitude'])), len(range(0,ds.dims['longitude']+1)))),
+            dims   = ['time', 'latitude', 'longitude'],
+            coords = {'time': times, 'latitude' : latitudes, 'longitude' : longitudes},
+            attrs  = {
+                'units'     : ds[dvar].attrs['units']
+            })
         })
 
-        ds_ext[dvar].values[:,:,0:len(ds['longitude'])] = ds[dvar].values
-        ds_ext[dvar].values[:,:,len(ds['longitude']):len(ds['longitude']) + 1] = ds[dvar][:,:,0:1].values
-    else:
-        # No time dimension
-        # Form the new data structure with a periodic longitude
-        ds_ext = xr.Dataset({
-            dvar : xr.DataArray(
-                data   = np.zeros((len(range(0,ds.dims['latitude'])), len(range(0,ds.dims['longitude']+1)))),
-                dims   = ['latitude', 'longitude'],
-                coords = {'latitude' : latitudes, 'longitude' : longitudes},
-                attrs  = {
-                    'units'     : ds[dvar].attrs['units']
-                })
-        })
-
-        ds_ext[dvar].values[:,0:len(ds['longitude'])] = ds[dvar].values
-        ds_ext[dvar].values[:,len(ds['longitude']):len(ds['longitude']) + 1] = ds[dvar][:,0:1].values
+    ds_ext[dvar].values[:,:,0:len(ds['longitude'])] = ds[dvar].values
+    ds_ext[dvar].values[:,:,len(ds['longitude']):len(ds['longitude']) + 1] = ds[dvar][:,:,0:1].values
 
     return ds_ext
 
@@ -129,7 +112,7 @@ def interp_landmask(landmask_file):
     lon_b = landmask['lon_b']
     filled = lon_b.interpolate_na(dim='nyp',method='linear',fill_value="extrapolate")
     filled_lon = filled.interpolate_na(dim='nxp',method='linear',fill_value="extrapolate")
-    
+
     # interpolate latitidue corners from latitude cell centers
     lat_corners = 0.25 * (
         lat_centers[:-1, :-1]
@@ -148,24 +131,25 @@ def interp_landmask(landmask_file):
     landmask['lon_b'] = filled_lon
     landmask['lat_b'] = filled_lat
     landmask['mask'] = landmask['mask'].where(landmask['mask'] != 1)
-    
+
     return landmask
 
-def interp_era5(era5_ds, era5_var):
-    #era = xr.open_dataset(era5_file)
-    era = era5_ds
+#def interp_era5(era5_ds, era5_var):
+def interp_era5(era5_file, era5_var):
+    era = xr.open_dataset(era5_file)
+    #era = era5_ds
     era = era.rename({'longitude': 'lon', 'latitude': 'lat'})
     if "lon" in era.coords:
         era = era.assign_coords(lon=(np.where(era['lon'].values > 180., era['lon'].values - 360, era['lon'].values)))
-        era = era.swap_dims({'lon' : 'nx'})    
-        era = era.swap_dims({'lat' : 'ny'}) 
+        era = era.swap_dims({'lon' : 'nx'})
+        era = era.swap_dims({'lat' : 'ny'})
     if "lon" in era.data_vars:
         era['lon'].values =  np.where(era['lon'].values > 180., era['lon'].values - 360, era['lon'].values)
 
     lon_centers = era['lon'].values
     lat_centers = era['lat'].values
-    # To use conservative regidding, we need the cells corners. 
-    # Since they are not provided, we are creating some using a crude approximation. 
+    # To use conservative regidding, we need the cells corners.
+    # Since they are not provided, we are creating some using a crude approximation.
     lon_corners = 0.25 * (
         lon_centers[:-1]
         + lon_centers[1:]
@@ -183,7 +167,7 @@ def interp_era5(era5_ds, era5_var):
     # trim down era by 1 cell
     era = era.isel(nx=slice(1,-1), ny=slice(1,-1))
     da_era_var=era[era5_var].values
-    
+
     # add nxp and nyp dimensions for the lat/lon corners to latch onto
     era = era.expand_dims({'nyp':(len(era.lat) + 1)})
     era = era.expand_dims({'nxp':(len(era.lon) + 1)})
@@ -194,108 +178,57 @@ def interp_era5(era5_ds, era5_var):
     # drop the variable
     era = era.drop_vars(era5_var)
     era[era5_var] = xr.DataArray(data=da_era_var, dims=("time" ,"lat", "lon"))
-    
+
     # create meshgrids for center and corner points so we can co-locate with landmask meshgrids.
     lon2d, lat2d = np.meshgrid(era.lon.values, era.lat.values)
     lon2d_b, lat2d_b = np.meshgrid(era.lon_corners.values, era.lat_corners.values)
-    
+
     # assign coordinates now that we have our corner points
     era = era.assign_coords({"lon" : (("ny", "nx"), lon2d)})
     era = era.assign_coords({"lat" : (("ny", "nx"), lat2d)})
     era = era.assign_coords({"lon_b" : (("nyp", "nxp"), lon2d_b)})
     era = era.assign_coords({"lat_b" : (("nyp", "nxp"), lat2d_b)})
-    
+
     return era
 
-#def flood_era5_data(era5_file,era5_var,landmask_file, outfile, reuse_weights=False):
-def flood_era5_data(era5_ds, era5_var, landmask_file, dataset_landmask, reuse_weights=False):
+#def flood_era5_data(era5_ds, era5_var, landmask_file, reuse_weights=False):
+def flood_era5_data(era5_file, era5_var, landmask_file, reuse_weights=False):
     global datatype
 
     # interp landmask
-    #landmask = xr.open_dataset(landmask_file)
-    #landmask = interp_landmask(landmask_file)
-    #landmask = landmask.rename({
-    #    'x': 'longitude',
-    #    'y': 'latitude'
-    #})
-    #landgrid = landmask.drop('mask')
-
-    #dataset_landmask.rename({'longitude':'lon', 'latitude':'lat'})
+    landmask = interp_landmask(landmask_file)
 
     #interp era
-    #era = interp_era5(era5_ds, era5_var)
-    era = era5_ds
-    era = era.rename({'longitude':'lon', 'latitude':'lat'})
+    era = interp_era5(era5_file, era5_var)
 
-    # Input  grid: ERA5
-    # Output grid: MOM6
-    # Typical coordinates are: lon, lat, lon_b, lat_b and mask
-    # for conservative gridding.
-
+    print("After interp")
     #breakpoint()
-
-    #regrid_domain = xe.Regridder(landmask, era, 'patch',
-    #    periodic=False, reuse_weights=reuse_weights, filename='regrid_domain.nc')
-    #land_regrid = regrid_domain(landmask.mask)
-    #land_regrid = land_regrid.expand_dims(time=era['time'])
-
-    #era_cut = era[era5_var].where(land_regrid.values == 0)
-    print("  -> era_cut")
-    era_cut = era[era5_var].where(dataset_landmask['mask'].values == 0)
-
-    # debug using a single time slice
-    debug = False
-    if debug:
-        print("  -> flood (debug)")
-        era_cut_one = era_cut.isel(time=0)
-        era_cut_one.to_netcdf('era_cut.nc')
-
-        flooded = flood.flood_kara(era_cut_one)
-        flooded = flooded.isel(z=0).drop('z')
-
-        flooded.to_netcdf('flood.nc')
-    else:
-        print("  -> flood")
-        flooded = flood.flood_kara(era_cut)
-        flooded = flooded.isel(z=0).drop('z')
-
-    # Convert flooded grid to model grid (without the mask variable)
-    #regrid_domain = xe.Regridder(flooded, landgrid, 'patch',
-    #    periodic=True, reuse_weights=reuse_weights, filename='regrid_domain.nc',
-    #    ignore_degenerate=True)
-
-    #data = regrid_domain(flooded)
-
-    #data.to_netcdf('regrid.nc')
-
-    #breakpoint()
-    
     # regrid conservatively: conservative does the best, especially along fine points
-    #print("  -> Regridder")
-    #regrid_domain = xe.Regridder(landmask, era, 'conservative',
-    #    periodic=False, reuse_weights=reuse_weights, filename='regrid_domain.nc')
-    #print("  -> regrid_domain")
-    #land_regrid = regrid_domain(landmask.mask)
-    #land_regrid = land_regrid.expand_dims(time=era['time'])
-    #land_regrid = land_regrid.transpose("time", "ny", "nx")
+    # Arctic12 is periodic
+    regrid_domain = xesmf.Regridder(landmask, era, 'conservative',
+                                    periodic=True, reuse_weights=reuse_weights, filename='regrid_domain.nc')
+    land_regrid = regrid_domain(landmask.mask)
+    land_regrid = land_regrid.expand_dims(time=era['time'])
+    land_regrid = land_regrid.transpose("time", "ny", "nx")
     #print(land_regrid)
-    #era = era.transpose("time", "lat", "lon", "ny", "nx", "nyp", "nxp")
+    era = era.transpose("time", "lat", "lon", "ny", "nx", "nyp", "nxp")
     # cut era based on regridded landmask
-    #era_cut = era[era5_var].where(land_regrid.values == 0)
+    era_cut = era[era5_var].where(land_regrid.values == 0)
 
     # flood our cut out points
-    #breakpoint()
-    #flooded = flood.flood_kara(era_cut)
-    #flooded = flooded.isel(z=0).drop('z')
+    flooded = flood.flood_kara(era_cut)
+    flooded = flooded.isel(z=0).drop('z')
     #print(flooded)
     # note that this current version of this code will cut down your era5 domain by 2 rows/cols)
-    #era = xr.open_dataset(era5_file)
+    era = xr.open_dataset(era5_file)
     #era = era5_ds
-    #era = era.isel(longitude=slice(1,len(era.longitude)-1), latitude=slice(1,len(era.latitude)-1))
-    #era = era.transpose("time", "latitude", "longitude")
-    
-    era[era5_var].values = flooded.values    
-    
+    #breakpoint()
+    era = era.isel(longitude=slice(1,len(era.longitude)-1), latitude=slice(1,len(era.latitude)-1))
+    era = era.transpose("time", "latitude", "longitude")
+
+    #breakpoint()
+    era[era5_var].values = flooded.values
+
     if era5_var=='ssrd' or era5_var=='strd':
         # convert radiation from J/m2 to W/m2: https://confluence.ecmwf.int/pages/viewpage.action?pageId=155337784
         era[era5_var].values = era[era5_var].values/3600
@@ -358,16 +291,15 @@ def checkPadding(thisYear, pastYear, era_var):
 # The processing order is set by this dictionary
 era5_dict = {
     'ERA5_2m_temperature':                      't2m',
-    'ERA5_sea_surface_temperature':             'sst',
+    'ERA5_total_rain_rate':                     'trr',
     'ERA5_sea_ice_cover':                       'siconc',
     'ERA5_10m_u_component_of_wind':             'u10',
     'ERA5_10m_v_component_of_wind':             'v10',
     'ERA5_2m_specific_humidity':                'huss',
+    'ERA5_sea_surface_temperature':             'sst',
     'ERA5_surface_solar_radiation_downwards':   'ssrd',
     'ERA5_surface_thermal_radiation_downwards': 'strd',
-    'ERA5_mean_sea_level_pressure':             'msl',
-    'ERA5_total_rain_rate':                     'trr',
-    'ERA5_snowfall':                            'sf'
+    'ERA5_mean_sea_level_pressure':             'msl'
 }
 
 # For testing, only process one field
@@ -384,18 +316,9 @@ lonsub = slice(0,360)
 
 # storage
 # NOT USED
-
-# directories
-era5dir = "/import/AKWATERS/kshedstrom/ERA5"
-subdir = "/import/AKWATERS/jrcermakiii/data/ERA5_periodic_subset"
-modeldir = "/import/AKWATERS/jrcermakiii/configs/Arctic12/INPUT2"
-
-# files
-landmask_file = os.path.join(modeldir, "land_mask.nc")
-dataset_landmask_source_file = os.path.join(era5dir, "ERA5_sea_surface_temperature_1993.nc")
-dataset_landmask_file = os.path.join(subdir, 'ERA5_landmask.nc')
-
-# constants and flags
+era5dir = "/import/AKWATERS/kshedstrom/ERA5/"
+subdir = "/import/AKWATERS/jrcermakiii/data/ERA5_periodic_subset/"
+landmask_file = "/import/AKWATERS/jrcermakiii/configs/Arctic12/INPUT2/land_mask.nc"
 datatype = 'float32'
 usePadding = True
 useFlooding = True
@@ -403,27 +326,6 @@ useFlooding = True
 # Padding is required for MOM6 to provide continuity between restarts of
 # runs between blocks of time (in this case by year).
 firstYear=1993
-
-if not(os.path.isfile(dataset_landmask_file)):
-    # Obtain landmask from ERA5 dataset
-    # and subset
-    print("Extracting dataset land mask.")
-    ds_data = xr.open_dataset(dataset_landmask_source_file).sel(latitude=latsub, longitude=lonsub)
-
-    ds_data['mask'] = xr.DataArray(
-        data = np.where(np.isnan(ds_data['sst'][0,:,:].values),1,0),
-        dims = ['latitude','longitude']
-    )
-
-    dataset_landmask = ds_data['mask'].copy()
-    dataset_landmask = dataset_landmask.to_dataset()
-    dataset_landmask['mask'].attrs['units'] = 'dataset landmask'
-    dataset_landmask = make_periodic_append_longitude(dataset_landmask, 'mask', 0.25, has_time=False)
-    all_vars = list(dataset_landmask.data_vars.keys()) + list(dataset_landmask.coords.keys())
-    encodings = {v: {'_FillValue': None} for v in all_vars}
-    dataset_landmask.to_netcdf(dataset_landmask_file, mode='w', format='NETCDF4_CLASSIC', encoding=encodings)
-else:
-    dataset_landmask = xr.open_dataset(dataset_landmask_file)
 
 # Main program
 for f in era5_dict.keys():
@@ -434,16 +336,16 @@ for f in era5_dict.keys():
         # These two fields require special processing
         if f == 'ERA5_total_rain_rate':
             # Determine filenames for storage
-            thisYear = os.path.join(subdir, f + '_' + str(y) + ".nc")
-            pastYear = os.path.join(subdir, f + '_' + str(y-1) + ".nc")
+            thisYear = str(subdir + f + '_' + str(y) + ".nc")
+            pastYear = str(subdir + f + '_' + str(y-1) + ".nc")
 
             # Subset and flood if necessary
             if not(os.path.isfile(thisYear)):
                 #breakpoint()
                 print("  -> subset")
-                #crr = xr.open_dataset(str(era5dir + 'ERA5_convective_rain_rate_' + str(y) + '.nc'))
-                crr = xr.open_dataset(os.path.join(era5dir, 'ERA5_convective_rain_rate_' + str(y) + '.nc')).sel(latitude=latsub, longitude=lonsub)
-                lsrr = xr.open_dataset(os.path.join(era5dir, 'ERA5_large_scale_rain_rate_' + str(y) + '.nc')).sel(latitude=latsub, longitude=lonsub)
+                crr = xr.open_dataset(str(era5dir + 'ERA5_convective_rain_rate_' + str(y) + '.nc'))
+                crr = xr.open_dataset(str(era5dir + 'ERA5_convective_rain_rate_' + str(y) + '.nc')).sel(latitude=latsub, longitude=lonsub)
+                lsrr = xr.open_dataset(str(era5dir + 'ERA5_large_scale_rain_rate_' + str(y) + '.nc')).sel(latitude=latsub, longitude=lonsub)
                 trr = xr.Dataset()
                 trr['trr'] = crr['crr'] + lsrr['lsrr']
                 trr['trr'].attrs = {'units': 'kg m-2 s-1', 'long_name': 'Total rain rate (convective and large scale)'}
@@ -457,8 +359,8 @@ for f in era5_dict.keys():
 
                 # Flood
                 if useFlooding:
-                    trr = flood_era5_data(era5_ds=trr, era5_var='trr', reuse_weights=False, landmask_file=landmask_file,
-                        dataset_landmask=dataset_landmask)
+                    print("  -> flood")
+                    trr = flood_era5_data(era5_ds=trr, era5_var='trr', reuse_weights=False, landmask_file=landmask_file)
 
                 trr.to_netcdf(thisYear, mode='w', format='NETCDF4_CLASSIC', encoding=encodings)
                 crr.close()
@@ -474,15 +376,15 @@ for f in era5_dict.keys():
 
         if f == 'ERA5_2m_specific_humidity':
             # Determine filenames for storage
-            thisYear = os.path.join(subdir, f + '_' + str(y) + ".nc")
-            pastYear = os.path.join(subdir, f + '_' + str(y-1) + ".nc")
+            thisYear = str(subdir + f + '_' + str(y) + ".nc")
+            pastYear = str(subdir + f + '_' + str(y-1) + ".nc")
 
             # Subset and flood if necessary
             if not(os.path.isfile(thisYear)):
                 #breakpoint()
                 print("  -> subset")
-                pair = xr.open_dataset(os.path.join(era5dir, 'ERA5_surface_pressure_' + str(y) + '.nc'))['sp'].sel(latitude=latsub, longitude=lonsub) # Pa
-                tdew = xr.open_dataset(os.path.join(era5dir, 'ERA5_2m_dewpoint_temperature_' + str(y) + '.nc'))['d2m'].sel(latitude=latsub, longitude=lonsub) # K
+                pair = xr.open_dataset(str(era5dir + 'ERA5_surface_pressure_' + str(y) + '.nc'))['sp'].sel(latitude=latsub, longitude=lonsub) # Pa
+                tdew = xr.open_dataset(str(era5dir + 'ERA5_2m_dewpoint_temperature_' + str(y) + '.nc'))['d2m'].sel(latitude=latsub, longitude=lonsub) # K
 
                 smr = saturation_mixing_ratio(pair, tdew)
                 sphum = specific_humidity_from_mixing_ratio(smr)
@@ -499,11 +401,11 @@ for f in era5_dict.keys():
 
                 # Also fix the time encoding
                 encodings['time'].update({'dtype': datatype, 'calendar': 'gregorian', 'units': 'hours since 1900-01-01 00:00:00'})
-            
+
                 # Flood
                 if useFlooding:
-                    sphum = flood_era5_data(era5_ds=sphum, era5_var='huss', reuse_weights=False,
-                        landmask_file=landmask_file, dataset_landmask=dataset_landmask)
+                    print("  -> flood")
+                    sphum = flood_era5_data(era5_ds=sphum, era5_var='huss', reuse_weights=False, landmask_file=landmask_file)
 
                 sphum.to_netcdf(
                     thisYear,
@@ -523,25 +425,30 @@ for f in era5_dict.keys():
         # All other fields conform to a single processing method
         if 'total_rain_rate' not in f and 'specific_humidity' not in f:
             # Determine filenames for storage
-            thisYear = os.path.join(subdir, f + '_' + str(y) + ".nc")
-            pastYear = os.path.join(subdir, f + '_' + str(y-1) + ".nc")
-            
+            thisYear = str(subdir + f + '_' + str(y) + ".nc")
+            pastYear = str(subdir + f + '_' + str(y-1) + ".nc")
+
             # Subset and flood if necessary
             if not(os.path.isfile(thisYear)):
-                #breakpoint()
                 print("  -> subset")
-                ds_file = os.path.join(era5dir, f + '_' + str(y) + ".nc")
-                ds = xr.open_dataset(ds_file).sel(latitude=latsub, longitude=lonsub)
+                era5_file = str(era5dir + f + '_' + str(y) + ".nc")
+                ds = xr.open_dataset(era5_file).sel(latitude=latsub, longitude=lonsub)
+                print("Dataset open")
+                #breakpoint()
                 ds_attrs = save_attrs(ds)
                 ds = make_periodic_append_longitude(ds, era5_dict[f], 0.25)
+                print("After make_periodic")
+                breakpoint()
                 ds = fix_encoding_attrs(ds, ds_attrs)
 
                 # Flood
                 if useFlooding:
-                    ds = flood_era5_data(era5_ds=ds, era5_var=era5_dict[f], reuse_weights=False,
-                        landmask_file=landmask_file, dataset_landmask=dataset_landmask)
+                    print("  -> flood")
+                    ds = flood_era5_data(era5_file=era5_file, era5_var=era5_dict[f], reuse_weights=False, landmask_file=landmask_file)
+                    #ds = flood_era5_data(era5_ds=ds, era5_var=era5_dict[f], reuse_weights=False, landmask_file=landmask_file)
 
                 ds.to_netcdf(thisYear, format="NETCDF4_CLASSIC")
+                breakpoint()
                 ds.close()
 
             # Pad
