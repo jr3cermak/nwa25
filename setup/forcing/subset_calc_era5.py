@@ -129,7 +129,7 @@ def interp_landmask(landmask_file):
     lon_b = landmask['lon_b']
     filled = lon_b.interpolate_na(dim='nyp',method='linear',fill_value="extrapolate")
     filled_lon = filled.interpolate_na(dim='nxp',method='linear',fill_value="extrapolate")
-    
+
     # interpolate latitidue corners from latitude cell centers
     lat_corners = 0.25 * (
         lat_centers[:-1, :-1]
@@ -148,7 +148,7 @@ def interp_landmask(landmask_file):
     landmask['lon_b'] = filled_lon
     landmask['lat_b'] = filled_lat
     landmask['mask'] = landmask['mask'].where(landmask['mask'] != 1)
-    
+
     return landmask
 
 def interp_era5(era5_ds, era5_var):
@@ -183,7 +183,7 @@ def interp_era5(era5_ds, era5_var):
     # trim down era by 1 cell
     era = era.isel(nx=slice(1,-1), ny=slice(1,-1))
     da_era_var=era[era5_var].values
-    
+
     # add nxp and nyp dimensions for the lat/lon corners to latch onto
     era = era.expand_dims({'nyp':(len(era.lat) + 1)})
     era = era.expand_dims({'nxp':(len(era.lon) + 1)})
@@ -194,17 +194,17 @@ def interp_era5(era5_ds, era5_var):
     # drop the variable
     era = era.drop_vars(era5_var)
     era[era5_var] = xr.DataArray(data=da_era_var, dims=("time" ,"lat", "lon"))
-    
+
     # create meshgrids for center and corner points so we can co-locate with landmask meshgrids.
     lon2d, lat2d = np.meshgrid(era.lon.values, era.lat.values)
     lon2d_b, lat2d_b = np.meshgrid(era.lon_corners.values, era.lat_corners.values)
-    
+
     # assign coordinates now that we have our corner points
     era = era.assign_coords({"lon" : (("ny", "nx"), lon2d)})
     era = era.assign_coords({"lat" : (("ny", "nx"), lat2d)})
     era = era.assign_coords({"lon_b" : (("nyp", "nxp"), lon2d_b)})
     era = era.assign_coords({"lat_b" : (("nyp", "nxp"), lat2d_b)})
-    
+
     return era
 
 #def flood_era5_data(era5_file,era5_var,landmask_file, outfile, reuse_weights=False):
@@ -269,7 +269,7 @@ def flood_era5_data(era5_ds, era5_var, landmask_file, dataset_landmask, reuse_we
     #data.to_netcdf('regrid.nc')
 
     #breakpoint()
-    
+
     # regrid conservatively: conservative does the best, especially along fine points
     #print("  -> Regridder")
     #regrid_domain = xe.Regridder(landmask, era, 'conservative',
@@ -293,9 +293,9 @@ def flood_era5_data(era5_ds, era5_var, landmask_file, dataset_landmask, reuse_we
     #era = era5_ds
     #era = era.isel(longitude=slice(1,len(era.longitude)-1), latitude=slice(1,len(era.latitude)-1))
     #era = era.transpose("time", "latitude", "longitude")
-    
-    era[era5_var].values = flooded.values    
-    
+
+    era[era5_var].values = flooded.values
+
     if era5_var=='ssrd' or era5_var=='strd':
         # convert radiation from J/m2 to W/m2: https://confluence.ecmwf.int/pages/viewpage.action?pageId=155337784
         era[era5_var].values = era[era5_var].values/3600
@@ -499,7 +499,7 @@ for f in era5_dict.keys():
 
                 # Also fix the time encoding
                 encodings['time'].update({'dtype': datatype, 'calendar': 'gregorian', 'units': 'hours since 1900-01-01 00:00:00'})
-            
+
                 # Flood
                 if useFlooding:
                     sphum = flood_era5_data(era5_ds=sphum, era5_var='huss', reuse_weights=False,
@@ -525,7 +525,7 @@ for f in era5_dict.keys():
             # Determine filenames for storage
             thisYear = os.path.join(subdir, f + '_' + str(y) + ".nc")
             pastYear = os.path.join(subdir, f + '_' + str(y-1) + ".nc")
-            
+
             # Subset and flood if necessary
             if not(os.path.isfile(thisYear)):
                 #breakpoint()
